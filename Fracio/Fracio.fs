@@ -7,15 +7,16 @@ open Fabulous.XamarinForms
 open LiteDB
 open LiteDB.FSharp
 open Xamarin.Forms
-open System.Linq
 
 module App =
     type Ingredient =
         { Id: Guid
-          Name: string }
+          Name: string
+          Price: float }
         static member New() =
             { Id = Guid.NewGuid()
-              Name = "" }
+              Name = ""
+              Price = 0. }
     
     type DetailedIngredient =
         { Id: Guid
@@ -43,10 +44,15 @@ module App =
         
         | IngredientsLoaded of Ingredient list
         | CreateIngredient
+        | SaveIngredient of Guid
+        | DeleteIngredient of Ingredient
         | SetIngredientName of Guid * string
+        | SetIngredientPrice of Guid * float
         | IngredientSaved
+        | IngredientDeleted
         
         | AddIngredientToDetailed of Ingredient
+        | DeleteDetailedIngredient of Guid
         | SetMeasure of Guid * float
         | SetPrice of Guid * float
         | SetFractionedBy of int
@@ -54,6 +60,7 @@ module App =
     type CmdMsg =
         | LoadIngredientsCmd
         | SaveIngredientCmd of Ingredient
+        | DeleteIngredientCmd of Guid
 
     let mapCmdToMsg (sqlPath:string) (cmdMsg:CmdMsg) : Cmd<Msg> =
         let mapper = FSharpBsonMapper()
@@ -71,6 +78,13 @@ module App =
                 let collection = db.GetCollection<Ingredient>()
                 do collection.Upsert ingredient |> ignore
                 return IngredientSaved
+            } |> Cmd.ofAsyncMsg
+        | DeleteIngredientCmd id ->
+            async {
+                do! Async.SwitchToThreadPool()
+                let collection = db.GetCollection<Ingredient>()
+                do collection.Delete(BsonValue id) |> ignore
+                return IngredientDeleted
             } |> Cmd.ofAsyncMsg
     
     let initModel =
@@ -92,12 +106,28 @@ module App =
         | CreateIngredient ->
             let newIngredient = Ingredient.New()
             { model with Ingredients = newIngredient::model.Ingredients }, []
+        | SaveIngredient id ->
+            let ingredient = model.Ingredients |> List.find (fun x -> x.Id = id)
+            model, [ SaveIngredientCmd ingredient ]
+        | DeleteIngredient ingredient ->
+            let newIngredients =
+                model.Ingredients |> List.filter (fun x -> not (x.Equals ingredient))
+            let newDetailedIngredients =
+                model.DetailedIngredients |> List.filter (fun x -> not (x.IngredientId = ingredient.Id))
+            { model with Ingredients = newIngredients; DetailedIngredients = newDetailedIngredients }, [ DeleteIngredientCmd ingredient.Id ]
         | SetIngredientName (id, name) ->
             let ingredient = model.Ingredients |> List.find (fun x -> x.Id = id)
             let updatedIngredient = { ingredient with Name = name }
             let updatedIngredients = model.Ingredients |> List.map (fun x -> if x.Id = id then updatedIngredient else x)
-            { model with Ingredients = updatedIngredients }, [ SaveIngredientCmd updatedIngredient ]
+            { model with Ingredients = updatedIngredients }, []
+        | SetIngredientPrice (id, price) ->
+            let ingredient = model.Ingredients |> List.find (fun x -> x.Id = id)
+            let updatedIngredient = { ingredient with Price = price }
+            let updatedIngredients = model.Ingredients |> List.map (fun x -> if x.Id = id then updatedIngredient else x)
+            { model with Ingredients = updatedIngredients }, []
         | IngredientSaved ->
+            model, []
+        | IngredientDeleted ->
             model, []
             
         | AddIngredientToDetailed ingredient ->
@@ -107,9 +137,13 @@ module App =
                 | true ->
                     model.DetailedIngredients
                 | false ->
-                    let newDetailed = DetailedIngredient.New ingredient.Id ()
+                    let newDetailed = { DetailedIngredient.New ingredient.Id () with Price = ingredient.Price }
                     newDetailed::model.DetailedIngredients
             { model with DetailedIngredients = newDetails }, [  ]
+        | DeleteDetailedIngredient id ->
+            let newDetailedIngredients =
+                model.DetailedIngredients |> List.filter (fun x -> not (x.Id = id))
+            { model with DetailedIngredients = newDetailedIngredients }, []
         | SetMeasure (detailedId, measure) ->
             let detail = model.DetailedIngredients |> List.find (fun x -> x.Id = detailedId)
             let updatedDetail = { detail with Measure = measure }
@@ -135,18 +169,19 @@ module App =
                                 View.Button(
                                     text = "Ingredientes",
                                     command = (fun () -> NavigateTo IngredientsPage |> dispatch),
-                                    backgroundColor = Color.Transparent
+                                    backgroundColor = match model.CurrentPage with IngredientsPage -> Color.LightBlue | _ -> Color.Transparent
                                 )
                                 View.Button(
                                     text = "Fracionar",
                                     command = (fun () -> NavigateTo FractionPage |> dispatch),
-                                    backgroundColor = Color.Transparent
+                                    backgroundColor = match model.CurrentPage with FractionPage -> Color.LightBlue | _ -> Color.Transparent
                                 )
                             ]
                     )
                 )
             ),
             detail = View.NavigationPage(
+                padding = Thickness(4., 0.),
                 pages = [
                     match model.CurrentPage with
                     | IngredientsPage ->
@@ -159,23 +194,55 @@ module App =
                                             text = "Criar ingrediente",
                                             command = (fun () -> CreateIngredient |> dispatch)
                                         )
-                                        View.FlexLayout(
-                                            wrap = FlexWrap.Wrap,
-                                            justifyContent = FlexJustify.SpaceEvenly,
+                                        View.Grid(
+                                            rowdefs = Auto::[ for _ in model.Ingredients -> Auto ],
+                                            coldefs = [ Stars 0.1; Stars 0.7; Stars 0.2 ],
                                             children = [
+                                                View.Label(
+                                                    text = "Nome",
+                                                    verticalTextAlignment = TextAlignment.Center
+                                                ).Row(0).Column(1)
+                                                View.Label(
+                                                    text = "Preço",
+                                                    verticalTextAlignment = TextAlignment.Center
+                                                ).Row(0).Column(2)
                                                 for i in model.Ingredients do
-                                                    View.Frame(
-                                                        content =
-                                                            View.StackLayout(
-                                                                children = [
-                                                                    View.Entry(
-                                                                        text = i.Name,
-                                                                        placeholder = "Nome",
-                                                                        textChanged = (fun args -> SetIngredientName (i.Id, args.NewTextValue) |> dispatch)
-                                                                    )
-                                                                ]
-                                                            )
-                                                    )
+                                                    let row = (model.Ingredients |> List.findIndex (fun x -> x.Equals i)) + 1
+                                                    View.Button(
+                                                        text = "X",
+                                                        backgroundColor = Color.Red,
+                                                        textColor = Color.White,
+                                                        fontAttributes = FontAttributes.Bold,
+                                                        cornerRadius = 40,
+                                                        verticalOptions = LayoutOptions.Center,
+                                                        horizontalOptions = LayoutOptions.Center,
+                                                        height = 40.,
+                                                        width = 40.,
+                                                        command = (fun () -> DeleteIngredient i |> dispatch)
+                                                    ).Row(row).Column(0)
+                                                    View.Entry(
+                                                        text = i.Name,
+                                                        placeholder = "Nome",
+                                                        textChanged = (fun args -> SetIngredientName (i.Id, args.NewTextValue) |> dispatch),
+                                                        unfocused = fun (args: FocusEventArgs) ->
+                                                            match args.IsFocused with
+                                                            | true -> () |> ignore
+                                                            | false -> SaveIngredient i.Id |> dispatch
+                                                    ).Row(row).Column(1)
+                                                    View.Entry(
+                                                        text = string i.Price,
+                                                        keyboard = Keyboard.Numeric,
+                                                        textChanged = (fun args -> 
+                                                            match Double.TryParse(args.NewTextValue) with
+                                                            | false, _ ->
+                                                                ()
+                                                            | true, parsed ->
+                                                                SetIngredientPrice (i.Id, parsed) |> dispatch),
+                                                        unfocused = fun (args: FocusEventArgs) ->
+                                                            match args.IsFocused with
+                                                            | true -> () |> ignore
+                                                            | false -> SaveIngredient i.Id |> dispatch
+                                                    ).Row(row).Column(2)
                                             ]
                                         )
                                     ]
@@ -189,10 +256,9 @@ module App =
                             content = View.ScrollView(
                                 content = View.Grid(
                                     padding = Thickness(8.),
-                                    rowdefs = [ Auto; Absolute 30.; Star; Absolute 50. ],
+                                    rowdefs = [ Absolute 30.; Absolute 20.; Star; Absolute 50. ],
                                     coldefs = [ Star ],
                                     children = [
-                                        View.Label("Selecione os ingredientes para compor o fracionamento").Row(0)
                                         View.CollectionView(
                                             itemsLayout = LinearItemsLayout(ItemsLayoutOrientation.Horizontal, ItemSpacing = 7.),
                                             selectionMode = SelectionMode.Single,
@@ -202,7 +268,7 @@ module App =
                                                     View.Label(
                                                         text = i.Name,
                                                         padding = Thickness(2.),
-                                                        backgroundColor = Color.LightGray,
+                                                        backgroundColor = Color.LightGreen,
                                                         fontAttributes = FontAttributes.Bold,
                                                         tag = i
                                                     )
@@ -213,9 +279,14 @@ module App =
                                                 | Some item ->
                                                     let ingredient = item.TryGetTag<Ingredient>().Value
                                                     dispatch (AddIngredientToDetailed ingredient) )
+                                        ).Row(0)
+                                        View.Slider(
+                                            value = float model.FractionedBy,
+                                            minimumMaximum = (1., 50.),
+                                            valueChanged = (fun args -> SetFractionedBy (int (args.NewValue + 0.5)) |> dispatch)
                                         ).Row(1)
                                         let detailedRows = [ Auto ]@[ for _ in 0..model.DetailedIngredients.Length * 2 -> Auto ]
-                                        let detailedCols = [ Auto; Auto; Auto; Star ]
+                                        let detailedCols = [ Stars 0.1; Stars 0.2; Stars 0.2; Stars 0.2; Stars 0.2 ]
                                         View.Grid(
                                             rowdefs = detailedRows,
                                             coldefs = detailedCols,
@@ -223,11 +294,11 @@ module App =
                                                 View.Label(
                                                     text = "Ingrediente",
                                                     verticalTextAlignment = TextAlignment.Center
-                                                ).Column(0).Row(0)
+                                                ).Column(1).Row(0)
                                                 View.Label(
                                                     text = "Receita",
                                                     verticalTextAlignment = TextAlignment.Center
-                                                ).Column(2).Row(0)
+                                                ).Column(3).Row(0)
                                                 View.StackLayout(
                                                     orientation = StackOrientation.Horizontal,
                                                     horizontalOptions = LayoutOptions.End,
@@ -251,7 +322,7 @@ module App =
                                                                         SetFractionedBy parsed |> dispatch)
                                                         )
                                                     ]
-                                                ).Column(3).Row(0)
+                                                ).Column(4).Row(0)
                                                 let mutable curRow = 1
                                                 for i in model.DetailedIngredients do
                                                     let ingredient = model.Ingredients |> List.find (fun x -> x.Id = i.IngredientId)
@@ -260,18 +331,30 @@ module App =
                                                     View.BoxView(
                                                         color = backgroundColor
                                                     ).Row(curRow).ColumnSpan(detailedCols.Length).RowSpan(2)
+                                                    View.Button(
+                                                        text = "X",
+                                                        backgroundColor = Color.Red,
+                                                        textColor = Color.White,
+                                                        fontAttributes = FontAttributes.Bold,
+                                                        cornerRadius = 40,
+                                                        verticalOptions = LayoutOptions.Center,
+                                                        horizontalOptions = LayoutOptions.Center,
+                                                        height = 40.,
+                                                        width = 40.,
+                                                        command = (fun () -> DeleteDetailedIngredient i.Id |> dispatch)
+                                                    ).Column(0).Row(curRow).RowSpan(2)
                                                     View.Label(
                                                         text = ingredient.Name,
                                                         verticalTextAlignment = TextAlignment.Center
-                                                    ).Column(0).Row(curRow).RowSpan(2)
+                                                    ).Column(1).Row(curRow).RowSpan(2)
                                                     View.Label(
                                                         text = "Medida:",
                                                         verticalTextAlignment = TextAlignment.Center
-                                                    ).Column(1).Row(curRow)
+                                                    ).Column(2).Row(curRow)
                                                     View.Label(
                                                         text = "Preço:",
                                                         verticalTextAlignment = TextAlignment.Center
-                                                    ).Column(1).Row(curRow + 1)
+                                                    ).Column(2).Row(curRow + 1)
                                                     View.Entry(
                                                         text = string i.Measure,
                                                         keyboard = Keyboard.Numeric,
@@ -281,7 +364,7 @@ module App =
                                                                 ()
                                                             | true, parsed ->
                                                                 SetMeasure (i.Id, parsed) |> dispatch)
-                                                    ).Column(2).Row(curRow)
+                                                    ).Column(3).Row(curRow)
                                                     View.Entry(
                                                         text = string i.Price,
                                                         keyboard = Keyboard.Numeric,
@@ -291,17 +374,17 @@ module App =
                                                                 ()
                                                             | true, parsed ->
                                                                 SetPrice (i.Id, parsed) |> dispatch)
-                                                    ).Column(2).Row(curRow + 1)
+                                                    ).Column(3).Row(curRow + 1)
                                                     View.Label(
                                                         text = sprintf "%.3f" (i.Measure / fraction),
                                                         verticalTextAlignment = TextAlignment.Center,
                                                         horizontalOptions = LayoutOptions.End
-                                                    ).Column(3).Row(curRow)
+                                                    ).Column(4).Row(curRow)
                                                     View.Label(
                                                         text = sprintf "%.3f" (i.Price / fraction),
                                                         verticalTextAlignment = TextAlignment.Center,
                                                         horizontalOptions = LayoutOptions.End
-                                                    ).Column(3).Row(curRow + 1)
+                                                    ).Column(4).Row(curRow + 1)
                                                     curRow <- curRow + 2
                                             ]
                                         ).Row(2)
@@ -355,37 +438,3 @@ type App (sqlPath) as app =
     //
     //do runner.EnableLiveUpdate()
 #endif    
-
-    // Uncomment this code to save the application state to app.Properties using Newtonsoft.Json
-    // See https://fsprojects.github.io/Fabulous/Fabulous.XamarinForms/models.html#saving-application-state for further  instructions.
-#if APPSAVE
-    let modelId = "model"
-    override __.OnSleep() = 
-
-        let json = Newtonsoft.Json.JsonConvert.SerializeObject(runner.CurrentModel)
-        Console.WriteLine("OnSleep: saving model into app.Properties, json = {0}", json)
-
-        app.Properties.[modelId] <- json
-
-    override __.OnResume() = 
-        Console.WriteLine "OnResume: checking for model in app.Properties"
-        try 
-            match app.Properties.TryGetValue modelId with
-            | true, (:? string as json) -> 
-
-                Console.WriteLine("OnResume: restoring model from app.Properties, json = {0}", json)
-                let model = Newtonsoft.Json.JsonConvert.DeserializeObject<App.Model>(json)
-
-                Console.WriteLine("OnResume: restoring model from app.Properties, model = {0}", (sprintf "%0A" model))
-                runner.SetCurrentModel (model, Cmd.none)
-
-            | _ -> ()
-        with ex -> 
-            App.program.onError("Error while restoring model found in app.Properties", ex)
-
-    override this.OnStart() = 
-        Console.WriteLine "OnStart: using same logic as OnResume()"
-        this.OnResume()
-#endif
-
-
